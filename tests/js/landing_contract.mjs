@@ -84,7 +84,10 @@ assert.ok(hiddenAtStart.includes("landing-preview-note"), "the note for a previe
 // `dark: true` is a system set to its dark theme, as matchMedia reports it.
 // `held` names requests that wait until the scenario calls release(url, reply), with
 // a reply in the shape `replies` takes; a held request also ends when its signal aborts.
-function fixture({ pathname = "/", search = "", hash = "", access, replies = {}, hold = false, held = [], dark = false }) {
+// `clock: true` gives app.js timers that fire only when the scenario calls
+// advance(ms); without it they never fire. run.js keeps the real ones.
+function fixture({ pathname = "/", search = "", hash = "", access, replies = {}, hold = false, held = [], dark = false,
+  clock = false }) {
   const elements = new Map();
   class Element {
     constructor() {
@@ -165,6 +168,18 @@ function fixture({ pathname = "/", search = "", hash = "", access, replies = {},
     // History, capacity and quota are other seams; here they never answer.
     return new Promise(() => {});
   };
+  // The timers app.js sets, by when they are due on a clock only advance() moves.
+  const timers = new Map();
+  let now = 0;
+  let nextTimer = 0;
+  const later = clock
+    ? { setTimeout: (handler, ms = 0) => { timers.set(++nextTimer, { at: now + ms, handler }); return nextTimer; },
+        clearTimeout: (id) => { timers.delete(id); } }
+    : { setTimeout: () => 1, clearTimeout: () => {} };
+  // What the page listens for on its document (visibilitychange), and whether the tab is hidden.
+  const heard = [];
+  const page = { querySelector: get, querySelectorAll: () => [], createElement: () => new Element(),
+    addEventListener: (type, handler) => { heard.push([type, handler]); }, hidden: false, documentElement };
   const context = vm.createContext({
     createPaidReceipts: () => createPaidReceipts(() => ({ getItem: () => null, setItem: () => {}, removeItem: () => {} })),
     api, runView: { ...runView }, compareView,
@@ -184,14 +199,13 @@ function fixture({ pathname = "/", search = "", hash = "", access, replies = {},
     needsScopeWarning: () => false, modelKind,
     i18n: { t: (key) => speech.prefix + key, language: () => "English", locale: () => "en-GB", apply: () => {}, setLanguage: () => {},
             pageTitle: (name = "") => (name ? `${name} · brand_full` : "brand_full") },
-    document: { querySelector: get, querySelectorAll: () => [], createElement: () => new Element(),
-      addEventListener: () => {}, hidden: false, documentElement },
+    document: page,
     window: { matchMedia: () => ({ get matches() { return system.dark; },
       addEventListener: (type, handler) => { if (type === "change") system.heard.push(handler); } }), addEventListener: () => {} },
     localStorage: globalThis.localStorage, Event, URLSearchParams,
     history: { pushState: () => {}, replaceState: (_state, _unused, url) => replaced.push(url) },
     location: { pathname, search, hash, reload: () => reloads.push(true), replace: (url) => navigations.push(url) },
-    setTimeout: () => 1, clearTimeout: () => {}, setInterval: () => 1, clearInterval: () => {},
+    ...later, setInterval: () => 1, clearInterval: () => {},
     confirm: () => true,
   });
   vm.runInContext(source, context);
@@ -199,7 +213,27 @@ function fixture({ pathname = "/", search = "", hash = "", access, replies = {},
     release: (url, given) => { assert.ok(waiting.has(url), `${url} was asked for`); waiting.get(url)(given); waiting.delete(url); },
     asked: (url) => requests.filter((r) => r.url === url).length,
     deliver: () => deliver(), boot: () => documentElement.dataset.boot,
-    run: (text) => vm.runInContext(text, context) };
+    run: (text) => vm.runInContext(text, context),
+    // Moves the page's clock on by `ms`, firing each timer that falls due in
+    // order and letting what it started answer before the next one.
+    async advance(ms) {
+      const until = now + ms;
+      for (;;) {
+        const due = [...timers].filter(([, timer]) => timer.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!due) break;
+        timers.delete(due[0]);
+        now = due[1].at;
+        due[1].handler();
+        await settle();
+      }
+      now = until;
+    },
+    // The tab put in the background (true) or brought back (false), as a browser tells the page.
+    async hide(hidden) {
+      page.hidden = hidden;
+      for (const [type, handler] of heard) if (type === "visibilitychange") handler();
+      await settle();
+    } };
 }
 
 // Let the boot's promise chain and the replies above run to completion.
@@ -1345,6 +1379,156 @@ const scenarios = {
     f.release("/health", { retention_days: 30, active_runs: 0, max_concurrent: 5, contact: "operator@example.test" });
     await settle();
     assert.equal(named(), true, "The line is drawn again with the contact the reading published");
+  },
+  // ── How often the health reading is asked for ────────────────────────
+  // Found on main (55b6b7e) on 2026-11-28: any page with a run open asked
+  // for /health every second, a reader of a long-finished shared report
+  // included, for as long as the tab stayed open: 3,600 requests an hour
+  // from one reader. What the page takes from that reading (the capacity
+  // line, the operator's contact, the retention period, the deployment's
+  // model) does not change for a run that has ended or for someone who can
+  // only read it (tests/test_health_polling.py).
+  async a_finished_run_reads_the_health_once_not_every_second() {
+    const ended = (state) => ({ run_id: DEEP_LINK.slice(5), topic: "Fixture topic", state, stage: "Done",
+      error: state === "completed" ? null : "The run stopped.", error_code: null, steps: [], artifacts: [],
+      elapsed_seconds: 60, viewer_can_modify: true });
+    const ways = [...["completed", "failed", "cancelled", "timeout"].map((state) => [state, ended(state)]),
+      ["gone", { status: 404, body: { detail: "Run not found." } }]];
+    for (const [way, given] of ways) {
+      // Its owner's page, on a deployment open to all.
+      const f = fixture({ pathname: DEEP_LINK, access: { status: 200, body: { ok: true } }, clock: true,
+        replies: { [`${RUN_API}/progress?since=0`]: given } });
+      await settle();
+      assert.equal(f.get("#pane-run").hidden, false, way);
+      assert.equal(f.get("#run-gone").hidden, way !== "gone", way);
+      assert.equal(f.asked("/health"), 1, `${way}: the boot's one reading`);
+      await f.advance(60_000);
+      assert.equal(f.asked("/health"), 1, `${way}: a minute on, still that one reading, not one a second`);
+      // Away and back: the reading it has is still the one it needs.
+      await f.hide(true);
+      await f.hide(false);
+      await f.advance(60_000);
+      assert.equal(f.asked("/health"), 1, `${way}: nor once more each time the tab comes back`);
+    }
+  },
+  async a_reader_reads_the_health_once_whether_the_run_is_going_or_done() {
+    const readers = [
+      // A visitor with no identity who followed a shared link (the viewer bar).
+      ["a visitor with the link", refused(ACCOUNTS)],
+      // Someone the server says may not change this run (viewer_can_modify).
+      ["someone else's run", { status: 200, body: { ok: true } }],
+    ];
+    for (const state of ["running", "completed"]) {
+      for (const [who, access] of readers) {
+        const f = fixture({ pathname: DEEP_LINK, access, clock: true, replies: { [`${RUN_API}/progress?since=0`]: {
+          run_id: DEEP_LINK.slice(5), topic: "Fixture topic", state, stage: state === "running" ? "Writing" : "Done",
+          steps: [], artifacts: [], elapsed_seconds: 60, viewer_can_modify: false } } });
+        await settle();
+        assert.equal(f.get("#run-title").textContent, "Fixture topic", `${who}, ${state}: the run is on screen`);
+        assert.equal(f.asked("/health"), 1, `${who}, ${state}: the boot's one reading`);
+        await f.advance(60_000);
+        assert.equal(f.asked("/health"), 1, `${who}, ${state}: a minute on, still that one reading`);
+      }
+    }
+    // A shared comparison is read the same way, by someone who can start nothing from it.
+    const compare = fixture({ pathname: "/compare/20260926T121212Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/20260927T121212Z-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      access: refused(ACCOUNTS), clock: true });
+    await settle();
+    assert.equal(compare.get("#viewer-bar").hidden, false);
+    assert.equal(compare.asked("/health"), 1);
+    await compare.advance(60_000);
+    assert.equal(compare.asked("/health"), 1, "a shared comparison: still the one reading");
+  },
+  async a_reading_that_failed_is_asked_again_until_one_answers() {
+    // A finished run whose page could not reach /health says "offline" in
+    // its rail: that line must not outlast the outage.
+    const replies = { [`${RUN_API}/progress?since=0`]: { run_id: DEEP_LINK.slice(5), topic: "Fixture topic", state: "completed",
+      stage: "Done", steps: [], artifacts: [], elapsed_seconds: 60, viewer_can_modify: false }, "/health": "unreachable" };
+    const f = fixture({ pathname: DEEP_LINK, access: refused(ACCOUNTS), clock: true, replies });
+    await settle();
+    assert.equal(f.get("#capacity-label").textContent, "offline");
+    await f.advance(30_000);
+    const tries = f.asked("/health");
+    assert.ok(tries >= 2 && tries <= 4, `${tries} tries in 30 s: asked again, every ten seconds, while it fails`);
+    replies["/health"] = { retention_days: 30, active_runs: 0, max_concurrent: 5 };
+    await f.advance(10_000);
+    assert.equal(f.get("#capacity").hidden, true, "Answered: the offline line goes");
+    const answered = f.asked("/health");
+    await f.advance(60_000);
+    assert.equal(f.asked("/health"), answered, "...and with a reading in hand the page stops asking");
+  },
+  async a_running_runs_page_reads_the_health_no_faster_than_its_progress() {
+    const progress = `${RUN_API}/progress?since=0`;
+    const running = { run_id: DEEP_LINK.slice(5), topic: "Fixture topic", state: "running", stage: "Writing",
+      steps: [], artifacts: [], elapsed_seconds: 600, viewer_can_modify: true };
+    const replies = { [progress]: running };
+    const f = fixture({ pathname: DEEP_LINK, access: { status: 200, body: { ok: true } }, clock: true, replies });
+    await settle();
+    assert.equal(f.asked("/health"), 1);
+    await f.advance(60_000);
+    const reads = f.asked("/health") - 1;
+    // run.js asks for a running run's progress every 4 s once it has run 90 s (intervalFor).
+    assert.ok(reads >= 1 && reads <= 60_000 / 4000, `${reads} readings in a minute beside the progress poll`);
+    // The run ends while its page is open: its slot is free, so the reading
+    // is asked once more, and then not again.
+    const beforeEnd = f.asked("/health");
+    replies[progress] = { ...running, state: "completed", stage: "Done" };
+    f.run("follower.poll()");
+    await settle();
+    assert.equal(f.get("#run-pill").textContent, runView.stateLabel("completed"), "The page saw the run end");
+    assert.equal(f.asked("/health"), beforeEnd + 1, "Asked once as the run ends: its slot is free now");
+    await f.advance(120_000);
+    assert.equal(f.asked("/health"), beforeEnd + 1, "...and then no more");
+  },
+  async a_running_runs_page_still_shows_what_the_health_reading_says() {
+    // Kept as it was: the capacity line follows the deployment while the run
+    // goes, and when the run fails in a way only the operator can look into,
+    // the contact under it is the one the reading published.
+    const progress = `${RUN_API}/progress?since=0`;
+    const running = { run_id: DEEP_LINK.slice(5), topic: "Fixture topic", state: "running", stage: "Writing",
+      steps: [], artifacts: [], elapsed_seconds: 600, viewer_can_modify: true };
+    const replies = { [progress]: running, "/health": { retention_days: 30, active_runs: 1, max_concurrent: 5 } };
+    const f = fixture({ pathname: DEEP_LINK, access: { status: 200, body: { ok: true } }, clock: true, replies });
+    await settle();
+    assert.equal(f.get("#capacity").hidden, true, "A free slot is nobody's business");
+    assert.equal(f.get("#run-help").hidden, true);
+    replies["/health"] = { retention_days: 30, active_runs: 5, max_concurrent: 5, contact: "operator@example.test" };
+    await f.advance(20_000);
+    assert.equal(f.get("#capacity").hidden, false, "Every slot taken: said on the running run's page");
+    assert.equal(f.get("#capacity-label").textContent, "capacity_busy");
+    replies[progress] = { ...running, state: "failed", error: "The run stopped.", error_code: null };
+    f.run("follower.poll()");
+    await settle();
+    assert.equal(f.get("#run-help").hidden, false, "A failure only the operator can look into");
+    assert.ok(f.get("#run-help-contact").children.some((node) => node.textContent === "operator@example.test"),
+      "...with the contact the reading published while the run went");
+  },
+  async a_hidden_tab_asks_for_no_health_reading_until_it_is_back() {
+    const f = fixture({ pathname: DEEP_LINK, access: { status: 200, body: { ok: true } }, clock: true, replies: {
+      [`${RUN_API}/progress?since=0`]: { run_id: DEEP_LINK.slice(5), topic: "Fixture topic", state: "running",
+        stage: "Writing", steps: [], artifacts: [], elapsed_seconds: 600, viewer_can_modify: true } } });
+    await settle();
+    const before = f.asked("/health");
+    await f.hide(true);
+    await f.advance(120_000);
+    assert.equal(f.asked("/health"), before, "Nothing asked while the tab is in the background");
+    await f.hide(false);
+    assert.equal(f.asked("/health"), before + 1, "Back: read at once, so the page never shows an old reading");
+
+    // Put away while a reading is on its way: its answer schedules nothing.
+    const held = fixture({ pathname: DEEP_LINK, access: { status: 200, body: { ok: true } }, clock: true, held: ["/health"],
+      replies: { [`${RUN_API}/progress?since=0`]: { run_id: DEEP_LINK.slice(5), topic: "Fixture topic", state: "running",
+        stage: "Writing", steps: [], artifacts: [], elapsed_seconds: 600, viewer_can_modify: true } } });
+    await settle();
+    const reading = { retention_days: 30, active_runs: 0, max_concurrent: 5 };
+    held.release("/health", reading);
+    await held.advance(10_000);
+    assert.equal(held.asked("/health"), 2, "The running run's page asked again");
+    await held.hide(true);
+    held.release("/health", reading);
+    await settle();
+    await held.advance(120_000);
+    assert.equal(held.asked("/health"), 2, "Answered after the tab was hidden: nothing more is asked while it stays so");
   },
   async nothing_stored_asks_for_no_history() {
     const f = fixture({ access: refused(ACCOUNTS) });

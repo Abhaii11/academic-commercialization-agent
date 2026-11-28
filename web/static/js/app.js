@@ -61,9 +61,12 @@ let receiptLookupActive = false;
  * poll and are defined far above it, so leaving these in the boot section
  * made correctness depend on nothing calling those before the module body
  * finished — true today, and not a property worth relying on. */
-const CAPACITY_INTERVAL_ACTIVE = 1000;
-const CAPACITY_INTERVAL_IDLE = 10000;
+const CAPACITY_INTERVAL = 10_000;
 let capacityTimer = null;
+// Whether the run on screen has stopped changing for whoever is reading it:
+// it has ended (or is not there), or the server says this reader may not
+// change it. Set from the run's own reads (openRun); see scheduleCapacity.
+let activeRunSettled = false;
 
 /* ── Toasts ────────────────────────────────────────────────────────── */
 
@@ -284,8 +287,8 @@ function showCompose() {
   catch { toast(t("msg_history_unavailable"), "error"); }
   refreshSidebar();
   // Re-time capacity polling: the pending timer was scheduled for whichever
-  // state we just left, so without this a run starting waits out the idle
-  // delay before the display starts tracking it.
+  // state we just left, and a finished run's page had stopped asking at all
+  // (scheduleCapacity), so without this the composer's line would not move.
   scheduleCapacity();
   refreshQuota();
   $("#topic").focus();
@@ -1082,6 +1085,8 @@ document.addEventListener("visibilitychange", () => {
  * signed-in user. */
 function showGone() {
   stopClock();
+  // Nothing left to follow, and the retention period it quotes is already read.
+  activeRunSettled = true;
   $("#run-head").hidden = true;
   // Emptied as well as hidden: a loading view left in it would go on saying,
   // to whatever reads the page's status regions, that the run is being read.
@@ -1211,6 +1216,8 @@ async function openRun(runId, { known } = {}) {
   stopFollowing();
   // Another run, or this one drawn again in another language.
   dropLiveDraft();
+  // Not known to be settled until its reads say so (onUpdate, onDone, showGone).
+  activeRunSettled = false;
   showRun(runId);
   $("#run-connection").textContent = "";
   $("#run-gone").hidden = true;
@@ -1261,6 +1268,9 @@ async function openRun(runId, { known } = {}) {
     },
     onUpdate(progress) {
       if (progress.state === "running") watchedActive = true;
+      // Someone else's run, going or not: nothing its reader can do here
+      // changes with the deployment's health reading (scheduleCapacity).
+      if (!mayModify(progress)) activeRunSettled = true;
       lastProgress = progress;
       $("#run-head").hidden = false;
       paintHeader(progress);
@@ -1289,6 +1299,11 @@ async function openRun(runId, { known } = {}) {
         toast(runView.failureText(progress), "error");
       }
       if (watchedActive) announceFinish(progress);
+      // Ended: the page keeps the reading it has from here on. One that saw
+      // the run go asks once more, as its slot has just been given back, so
+      // the capacity line does not go on counting it.
+      activeRunSettled = true;
+      if (watchedActive) refreshCapacity();
 
       // A failed run keeps its stage list and may now expose a retrieval
       // diagnostic artifact. Where it stopped and what the search rejected
@@ -4090,19 +4105,47 @@ paintPaidReceipt();
  * overnight sent ~86k requests to say the deployment was idle, on a platform
  * that meters them.
  *
- * Two changes. It backs off to 10s when no run is active — capacity only
- * changes when someone starts or finishes a run, and this client knows when
- * it started one. And it stops entirely while the tab is hidden, resuming
- * with an immediate refresh so a returning user never reads a stale number.
+ * It backed off to 10s when no run was active, and it stops entirely while
+ * the tab is hidden, resuming with an immediate refresh so a returning user
+ * never reads a stale number.
+ *
+ * With a run open it still asked every second, until 2026-11-28: a reader
+ * of a shared report finished weeks before sent 3,600 requests an hour, as
+ * did every other tab left on a run. Nothing on a run's page needs that.
+ * The run's own state, stage and estimate come from its progress poll
+ * (run.js follow, every 1.2 to 4 s); what this reading gives is the
+ * deployment's: the capacity line, the operator's contact under a failed
+ * run, the retention period on the gone page, the model a resume would use.
+ * So a running run's page asks every 10 s like every other, never more often
+ * than its progress, and once more when it sees the run end (openRun
+ * onDone), its slot being free from then.
+ *
+ * A page whose facts have stopped changing for its reader asks no more once
+ * it has a reading (capacityCurrent): a run that has ended or is not there,
+ * and whatever a reader is shown, who can start or change nothing from it.
+ * One that could not be read is asked again on the same 10 s, so "offline"
+ * does not stay on screen after the server is back.
  */
 function scheduleCapacity() {
   if (capacityTimer) clearTimeout(capacityTimer);
-  if (document.hidden) return;
-  const delay = activeRunId ? CAPACITY_INTERVAL_ACTIVE : CAPACITY_INTERVAL_IDLE;
+  capacityTimer = null;
+  if (document.hidden || capacityCurrent()) return;
   capacityTimer = setTimeout(async () => {
+    capacityTimer = null;
+    // Decided when the timer fires: a run's first read, which says whether
+    // it has ended or is someone else's, comes after its page has scheduled this.
+    if (capacityCurrent()) return;
     await refreshCapacity();
     scheduleCapacity();
-  }, delay);
+  }, CAPACITY_INTERVAL);
+}
+
+/* The reading on screen is the last one this view needs: a visitor with a
+ * link (viewerMode), or a run that is settled (activeRunSettled), and a
+ * reading that answered. */
+function capacityCurrent() {
+  const settled = viewerMode || (activeRunId !== null && activeRunSettled);
+  return settled && capacityReading !== null && capacityReading !== "offline";
 }
 
 document.addEventListener("visibilitychange", () => {
@@ -4112,7 +4155,7 @@ document.addEventListener("visibilitychange", () => {
     if (activityTimer) clearTimeout(activityTimer);
     activityTimer = null;
   } else {
-    refreshCapacity();
+    if (!capacityCurrent()) refreshCapacity();
     scheduleCapacity();
     // A run may have ended while the tab was away: the list says.
     if (accountActivity.activeRuns.length || accountActivity.atCapacity) refreshSidebar();

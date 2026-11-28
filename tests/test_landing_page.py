@@ -98,6 +98,15 @@ SCENARIOS = (
     # The run's read now answers before the health reading: the operator's
     # contact under a failed run is drawn again when the reading comes.
     "a_failed_runs_contact_comes_when_the_health_reading_does",
+    # How often /health is asked for: once for a run that has ended or a
+    # reader's page, no faster than the progress poll on a running run's,
+    # and not at all from a hidden tab (tests/test_health_polling.py).
+    "a_finished_run_reads_the_health_once_not_every_second",
+    "a_reader_reads_the_health_once_whether_the_run_is_going_or_done",
+    "a_reading_that_failed_is_asked_again_until_one_answers",
+    "a_running_runs_page_reads_the_health_no_faster_than_its_progress",
+    "a_running_runs_page_still_shows_what_the_health_reading_says",
+    "a_hidden_tab_asks_for_no_health_reading_until_it_is_back",
     "nothing_stored_asks_for_no_history",
     # "Get both keys in 3 steps" where the first assessment is free.
     "the_key_guide_under_the_keys_form_knows_a_free_run_is_left",
