@@ -1037,7 +1037,13 @@ def _exercise_shared_link_reader(browser, base_url: str, owned_pair: tuple[str, 
     context.route("**/*", guard)
     page = context.new_page()
     page.on("pageerror", lambda error: errors.append(str(error)))
+    # Every /health the page asks for. Until 2026-11-28 a reader of a finished
+    # report asked for it every second for as long as the tab stayed open.
+    health_reads: list[str] = []
+    page.on("request", lambda request: health_reads.append(request.url)
+            if urlsplit(request.url).path == "/health" else None)
     pages = 0
+    health_while_reading = -1
     try:
         # The code holder's resume read above with its owner's header, as the
         # reader of its link sees it (production run 20261120T131247Z had
@@ -1046,6 +1052,15 @@ def _exercise_shared_link_reader(browser, base_url: str, owned_pair: tuple[str, 
         page.goto(f"{base_url}/run/{resumed}", wait_until="domcontentloaded")
         expect(page.locator("#viewer-bar")).to_be_visible()
         expect(page.locator("#run-pill")).to_have_text("completed")
+        # The boot's one reading is all a reader's page asks for: none in the
+        # next few seconds (main asked for three or four in this time).
+        expect(page.locator("html")).to_have_attribute("data-boot", "ready")
+        page.wait_for_timeout(500)
+        before = len(health_reads)
+        page.wait_for_timeout(3500)
+        health_while_reading = len(health_reads) - before
+        assert health_while_reading == 0, (
+            f"A reader of a finished run asked for /health {health_while_reading} times in 3.5 s")
         head = page.locator("#run-head")
         expect(page.locator("#run-assessed")).to_have_text(_assessed(stopped, resumed))
         expect(page.locator("#run-model")).to_have_text(f"· Model: {UNPRICED_MODEL}")
@@ -1126,7 +1141,8 @@ def _exercise_shared_link_reader(browser, base_url: str, owned_pair: tuple[str, 
         raise
     finally:
         context.close()
-    return {"reader_pages": pages, "reader_refused_requests": len(refused)}
+    return {"reader_pages": pages, "reader_refused_requests": len(refused),
+            "reader_health_reads_in_3_5_s": health_while_reading}
 
 
 def _exercise_browser(
